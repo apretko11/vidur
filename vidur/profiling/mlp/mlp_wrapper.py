@@ -106,6 +106,17 @@ class MlpWrapper:
 
             time_stats = self.timer_stats_store.get_stats()
 
+        if self.model.block.attn.rotary_emb is None and "attn_rope" not in time_stats:
+            # Structural zero, not a measurement: the model has no rotary op,
+            # and Vidur's predictor trains one model per profiled column.
+            time_stats["attn_rope"] = {
+                "min": 0.0,
+                "max": 0.0,
+                "mean": 0.0,
+                "median": 0.0,
+                "std": 0.0,
+            }
+
         stats = {
             "time_stats": time_stats,
             "n_head": self.model_config.num_q_heads,

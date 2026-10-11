@@ -66,8 +66,10 @@ class CausalSelfAttention(torch.nn.Module):
     def forward(self, hidden_states, positions):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        with self._attn_rope_timer:
-            q, k = self.rotary_emb(positions, q, k)
+        # Models with learned or no positions (e.g. GPT-3) have no rotary op.
+        if self.rotary_emb is not None:
+            with self._attn_rope_timer:
+                q, k = self.rotary_emb(positions, q, k)
         # output from attn has the same shape as q
         attn_output = torch.randn_like(q)
         output, _ = self.o_proj(attn_output)
@@ -137,6 +139,11 @@ class GPTBlock(torch.nn.Module):
         if config.post_attn_norm:
             if config.norm == "rms_norm":
                 self.post_attention_layernorm = RMSNorm(config.embedding_dim)
+            elif config.norm == "layer_norm":
+                # Pre-LayerNorm models (e.g. GPT-3) norm before the MLP too.
+                self.post_attention_layernorm = torch.nn.LayerNorm(
+                    config.embedding_dim
+                )
             else:
                 raise ValueError(
                     f"Unknown norm: {config.norm} for post_attention_layernorm"

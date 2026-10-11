@@ -210,8 +210,13 @@ class GPTModel(torch.nn.Module):
 
         self.num_repeat_steps = num_repeat_steps
 
+        # The vocabulary-parallel embedding needs vocab % TP == 0; pad an
+        # odd vocabulary (GPT-3: 50257) up to the next multiple of the TP
+        # degree, as serving frameworks pad it. The profile rows still record
+        # the model's vocab_size.
+        padded_vocab = -(-config.vocab_size // world_size) * world_size
         self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
+            padded_vocab,
             config.embedding_dim,
             linear_metric_name="emb",
             reduce_results=False,

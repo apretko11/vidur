@@ -1,12 +1,10 @@
 import atexit
-import heapq
 import json
-from math import isfinite
-from typing import List
 
 from vidur.config import SimulationConfig
 from vidur.entities import Cluster
-from vidur.events import BaseEvent, RequestArrivalEvent
+from vidur.event_loop import EventLoop
+from vidur.events import RequestArrivalEvent
 from vidur.logger import init_logger
 from vidur.metrics import MetricsStore
 from vidur.request_generator import RequestGeneratorRegistry
@@ -15,20 +13,15 @@ from vidur.scheduler import BaseGlobalScheduler, GlobalSchedulerRegistry
 logger = init_logger(__name__)
 
 
-class Simulator:
+class Simulator(EventLoop):
     def __init__(self, config: SimulationConfig) -> None:
         self._config: SimulationConfig = config
 
-        self._time = 0
-        self._terminate = False
-        self._time_limit = self._config.time_limit
-        if not self._time_limit:
-            self._time_limit = float("inf")
-
-        self._event_queue = []
-
-        self._event_trace = []
-        self._event_chrome_trace = []
+        super().__init__(
+            config.time_limit,
+            config.metrics_config.write_json_trace,
+            config.metrics_config.enable_chrome_trace,
+        )
 
         self._cluster = Cluster(
             self._config.cluster_config,
@@ -62,30 +55,15 @@ class Simulator:
             f"Starting simulation with cluster: {self._cluster} and {len(self._event_queue)} requests"
         )
 
-        while self._event_queue and not self._terminate:
-            _, event = self._event_queue[0]
-            if event.time > self._time_limit:
-                self._time = self._time_limit
-                self._terminate = True
-                break
-            heapq.heappop(self._event_queue)
-            self._set_time(event.time)
-            new_events = event.handle_event(self._scheduler, self._metric_store)
-            self._add_events(new_events)
-
-            if self._config.metrics_config.write_json_trace:
-                self._event_trace.append(event.to_dict())
-
-            if self._config.metrics_config.enable_chrome_trace:
-                chrome_trace = event.to_chrome_trace()
-                if chrome_trace:
-                    self._event_chrome_trace.append(chrome_trace)
-
-        if not self._scheduler.is_empty() and not self._terminate:
-            raise RuntimeError(
-                "simulation has unfinished requests with no events; check admission "
-                "capacity, execution dependencies and memory residency"
-            )
+        # Retain the live serving trace flags, including bare-loop test callers.
+        self._write_json_trace = self._config.metrics_config.write_json_trace
+        self._enable_chrome_trace = self._config.metrics_config.enable_chrome_trace
+        super().run()
+        if not self._terminate and any(
+            not context.aggregates_complete()
+            for context in getattr(self, "_aggregate_contexts", ())
+        ):
+            raise RuntimeError("simulation has unfinished aggregate work with no events")
 
         logger.info(f"Simulation ended at: {self._time}s")
 
@@ -103,14 +81,18 @@ class Simulator:
             self._write_chrome_trace()
             logger.info("Chrome event trace written")
 
-    def _add_event(self, event: BaseEvent) -> None:
-        if not isfinite(event.time) or event.time < self._time:
-            raise ValueError("events must have finite, nondecreasing timestamps")
-        heapq.heappush(self._event_queue, (event._priority_number, event))
+    def submit_aggregate(self, replica_id, submission):
+        """Opt-in resource-only work sharing a native replica's executor/heap."""
+        from vidur.aggregate_execution import enqueue_aggregate
 
-    def _add_events(self, events: List[BaseEvent]) -> None:
-        for event in events:
-            self._add_event(event)
+        replica = self._scheduler.get_replica_scheduler(replica_id)
+        context = replica.native_resource_context
+        if context is None:
+            raise ValueError("aggregate submission requires native resource execution")
+        enqueue_aggregate(self, context, submission, replica_id)
+        if not hasattr(self, "_aggregate_contexts"):
+            self._aggregate_contexts = set()
+        self._aggregate_contexts.add(context)
 
     def _init_event_queue(self) -> None:
         requests = self._request_generator.generate()

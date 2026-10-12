@@ -47,6 +47,7 @@ class BaseReplicaScheduler(ABC):
         self._memory_evictions = 0
         self._memory_recovery = False
         self._resource_executor = None
+        self.native_resource_context = None
         if execution_time_predictor.uses_execution_plans:
             from vidur.scheduler.memory_pool_manager import MemoryPoolManager
             from vidur.scheduler.resource_executor import ResourceExecutor
@@ -60,6 +61,11 @@ class BaseReplicaScheduler(ABC):
                 self._memory_manager = MemoryPoolManager(capacities)
             self._resource_executor = ResourceExecutor(
                 execution_time_predictor.resource_capacities(), self._memory_manager
+            )
+            from vidur.scheduler.native_resource_context import NativeResourceContext
+
+            self.native_resource_context = NativeResourceContext(
+                self._resource_executor, self, f"replica:{self._replica_id}"
             )
         elif (
             self._config.max_inflight_batches is not None

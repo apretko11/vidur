@@ -2,6 +2,8 @@ from vidur.types.base_int_enum import BaseIntEnum
 
 
 class EventType(BaseIntEnum):
+    # Queue ready aggregate owners before dispatch; existing values are stable.
+    AGGREGATE_SUBMIT = -1
     # at any given time step, call the schedule event at the last
     # to ensure that all the requests are processed
     RESOURCE_ACTIVITY_END = 0

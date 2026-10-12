@@ -2,6 +2,7 @@
 
 from vidur.entities import BatchStage
 from vidur.events.base_event import BaseEvent
+from vidur.scheduler.native_resource_context import AggregateOwner
 from vidur.types import EventType
 
 
@@ -31,12 +32,16 @@ def submit_native_batch(time, replica_id, stage_id, stage):
 
 
 class ResourceDispatchEvent(BaseEvent):
-    def __init__(self, time, replica_id):
+    def __init__(self, time, replica_id, *, context=None):
         super().__init__(time, EventType.RESOURCE_DISPATCH)
         self.replica_id = replica_id
+        self.context = context
 
     def handle_event(self, scheduler, metrics_store):
-        replica = scheduler.get_replica_scheduler(self.replica_id)
+        replica = self.context
+        if replica is None:
+            serving = scheduler.get_replica_scheduler(self.replica_id)
+            replica = getattr(serving, "native_resource_context", None) or serving
         executor = replica._resource_executor
         events = []
         for key in list(executor.plans):
@@ -46,7 +51,9 @@ class ResourceDispatchEvent(BaseEvent):
             events.extend(replica.on_native_plan_complete(key, self.time))
         for key, activity, start, finish in executor.dispatch(self.time):
             events.append(
-                ResourceActivityEndEvent(finish, self.replica_id, key, activity, start)
+                ResourceActivityEndEvent(
+                    finish, self.replica_id, key, activity, start, context=self.context
+                )
             )
         return events
 
@@ -54,24 +61,36 @@ class ResourceDispatchEvent(BaseEvent):
         return {
             "time": self.time,
             "event_type": int(self._event_type),
-            "replica_id": self.replica_id,
+            **(
+                {"resource_context_id": self.context.context_id}
+                if self.replica_id is None
+                else {"replica_id": self.replica_id}
+            ),
         }
 
 
 class ResourceActivityEndEvent(BaseEvent):
-    def __init__(self, time, replica_id, key, activity, start):
+    def __init__(self, time, replica_id, key, activity, start, *, context=None):
         super().__init__(time, EventType.RESOURCE_ACTIVITY_END)
         self.replica_id = replica_id
         self.key = key
         self.activity = activity
         self.start = start
+        self.context = context
 
     def handle_event(self, scheduler, metrics_store):
-        executor = scheduler.get_replica_scheduler(self.replica_id)._resource_executor
+        replica = self.context
+        if replica is None:
+            serving = scheduler.get_replica_scheduler(self.replica_id)
+            replica = getattr(serving, "native_resource_context", None) or serving
+        executor = replica._resource_executor
         executor.complete(self.key, self.activity.name, self.time)
-        events = [ResourceDispatchEvent(self.time, self.replica_id)]
+        if isinstance(self.key, AggregateOwner):
+            replica.on_activity_complete(self.key, self.activity, self.start, self.time)
+        events = [
+            ResourceDispatchEvent(self.time, self.replica_id, context=self.context)
+        ]
         if self.activity.memory_releases:
-            replica = scheduler.get_replica_scheduler(self.replica_id)
             events.extend(replica.on_native_memory_release(self.time))
         return events
 
@@ -79,9 +98,20 @@ class ResourceActivityEndEvent(BaseEvent):
         return {
             "time": self.time,
             "event_type": int(self._event_type),
-            "replica_id": self.replica_id,
-            "stage_id": self.key[0],
-            "batch_id": self.key[1],
+            **(
+                {"resource_context_id": self.context.context_id}
+                if self.replica_id is None
+                else {"replica_id": self.replica_id}
+            ),
+            **(
+                {
+                    "work_kind": "aggregate",
+                    "work_id": self.key.work_id,
+                    "completion_id": self.key.completion_id,
+                }
+                if isinstance(self.key, AggregateOwner)
+                else {"stage_id": self.key[0], "batch_id": self.key[1]}
+            ),
             "activity": self.activity.name,
             "start_seconds": self.start,
             "duration_seconds": self.activity.duration_seconds,
@@ -101,7 +131,9 @@ class ResourceActivityEndEvent(BaseEvent):
         return {
             "name": self.activity.name,
             "ph": "X",
-            "pid": self.replica_id,
+            "pid": self.replica_id
+            if self.replica_id is not None
+            else self.context.context_id,
             "tid": "+".join(self.activity.resources),
             "ts": self.start * 1e6,
             "dur": (self.time - self.start) * 1e6,

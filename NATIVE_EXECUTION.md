@@ -39,3 +39,61 @@ simulation that stops with unfinished requests raises instead of asserting.
 
 Run core tests with `python -m unittest discover -s tests`. PIMScope carries
 end-to-end serving, request-lifecycle, pipeline and calibrated-model regressions.
+
+## Request-free aggregate work (opt-in)
+
+`ExecutionPlanBuilder.build_declaration(declaration, costs, capacities)` performs
+the same pure materialization without SelectedWork. Accesses require an explicit
+owner validator; ordinary `build(work)` supplies its original request/pool checks.
+Aggregate execution currently rejects all memory accesses, including on a
+replica with serving memory pools. No aggregate allocation semantics are inferred.
+
+```python
+from vidur.aggregate_execution import AggregateExecutionSimulation, AggregateSubmission
+from vidur.scheduler.execution_plan_builder import (
+    ActivityDeclaration, BoundCost, ExecutionPlanBuilder, PlanDeclaration,
+)
+from vidur.scheduler.native_resource_context import AggregateOwner
+
+declaration = PlanDeclaration((
+    ActivityDeclaration("A", "A", ("R0",)),
+    ActivityDeclaration("B", "B", ("R1",)),
+    ActivityDeclaration("C", "C", ("R0",), ("A", "B")),
+    ActivityDeclaration("D", "D", ("R0",)),
+), plan_id="synthetic-resource-fixture")
+costs = {name: BoundCost(seconds, "Synthetic seconds; no calibration", "Activity")
+         for name, seconds in {"A": 3, "B": 2, "C": 1, "D": 2}.items()}
+capacities = {"R0": 1, "R1": 1}
+plan = ExecutionPlanBuilder.build_declaration(declaration, costs, capacities)
+simulation = AggregateExecutionSimulation(capacities, (
+    AggregateSubmission(AggregateOwner("slice_0", "slice_complete"), plan),
+))
+simulation.run()
+result = simulation.report()
+assert result["completions"][0]["makespan_seconds"] == 6
+```
+
+Increasing R0 capacity to two gives four seconds. These are correctness
+fixtures, not hardware measurements. All owners in a program share one unchanged
+ResourceExecutor. Multiple bounded submissions have explicit ready times and
+FIFO/activity tie breaking. The public Simulator.submit_aggregate(replica_id,
+submission) also permits resource-only aggregate work to contend with genuine
+serving plans in that native replica. Slot-only replicas reject it.
+
+The earlier c793dd8 EventLoop extraction is reused by both Simulator and
+AggregateExecutionSimulation. Both run the same heap loop, ResourceDispatchEvent
+and ResourceActivityEndEvent. Existing event type integers and serving trace
+fields remain unchanged. AGGREGATE_SUBMIT (-1) queues owner readiness before
+same-time dispatch; it does not reserve capacity. Activity ends (0) release
+resources before dispatch (8). NativeResourceContext routes tagged AggregateOwner
+completion to an exactly-once all-work record; stage/batch tuple keys still route
+to the original serving callback. No aggregate path enters BatchStageEnd/BatchEnd.
+
+Records include completion identity, activity intervals, makespan, summed service,
+reservation utilization and native JSON/Chrome traces with cost provenance.
+Makespan includes waiting, and differs from summed service when activities
+overlap. TTFT, TPOT and token throughput are undefined for aggregates. No serving
+objects or metric store are created by the aggregate entry. A time-limited partial
+execution cannot produce a completion report; diagnostics retain partial evidence.
+Empty work requires an explicit omission boundary. Physical placement, aggregate
+memory, dynamic online admission and performance calibration are not provided.

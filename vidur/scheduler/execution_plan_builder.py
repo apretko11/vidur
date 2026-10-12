@@ -67,7 +67,9 @@ class SelectedWork:
         if type(self.requests) is not tuple or any(
             not isinstance(r, SelectedRequest) for r in self.requests
         ):
-            raise ValueError("selected requests must be an immutable tuple of snapshots")
+            raise ValueError(
+                "selected requests must be an immutable tuple of snapshots"
+            )
         ids = [r.request_id for r in self.requests]
         if not ids or len(set(ids)) != len(ids):
             raise ValueError("selected work requires distinct requests")
@@ -89,7 +91,9 @@ class SelectedWork:
                 raise ValueError("prefill completion must be a boolean")
             if r.is_prefill_complete:
                 if r.num_processed_tokens <= r.num_prefill_tokens:
-                    raise ValueError("completed prefill must include the first output token")
+                    raise ValueError(
+                        "completed prefill must include the first output token"
+                    )
             elif (
                 r.num_processed_tokens >= r.num_prefill_tokens
                 or r.num_processed_tokens + r.next_num_tokens > r.num_prefill_tokens
@@ -171,6 +175,28 @@ class ExecutionPlanBuilder:
         capacities = self.policy.resource_capacities()
         pools = self.policy.memory_pool_capacities()
         ids = {r.request_id for r in work.requests}
+
+        def validate_access(access):
+            if access.request_id not in ids or access.pool not in pools:
+                raise ValueError(
+                    "memory access outside selected work or declared pools"
+                )
+
+        return self.build_declaration(declaration, costs, capacities, validate_access)
+
+    @staticmethod
+    def build_declaration(declaration, costs, capacities, access_validator=None):
+        """Materialize evidenced work without requiring serving snapshots.
+
+        Without an explicit memory-owner validator, accesses fail closed. The
+        serving entry supplies exactly its existing selected-request checks.
+        This method never selects work, schedules activities or advances tokens.
+        """
+        if not capacities or any(
+            not isinstance(name, str) or not name or type(n) is not int or n < 1
+            for name, n in capacities.items()
+        ):
+            raise ValueError("resource capacities must be named positive integers")
         activities = []
         for activity in declaration.activities:
             if activity.cost_key not in costs:
@@ -180,11 +206,14 @@ class ExecutionPlanBuilder:
                 + activity.memory_writes
                 + activity.memory_releases
             ):
-                if access.request_id not in ids or access.pool not in pools:
+                if access_validator is None:
                     raise ValueError(
-                        "memory access outside selected work or declared pools"
+                        "memory accesses require an explicit owner validator"
                     )
+                access_validator(access)
             cost = costs[activity.cost_key]
+            if not isinstance(cost, BoundCost):
+                raise TypeError("cost bindings require evidenced BoundCost values")
             activities.append(
                 ExecutionActivity(
                     activity.name,
